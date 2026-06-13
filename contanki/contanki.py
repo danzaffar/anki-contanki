@@ -7,7 +7,7 @@ from typing import Any, Callable
 from collections import defaultdict
 
 from aqt import gui_hooks
-from aqt.qt import QAction, qconnect
+from aqt.qt import QAction, QTimer, qconnect
 from aqt.utils import current_window, tooltip
 from aqt.webview import AnkiWebView
 
@@ -63,6 +63,7 @@ class Contanki(AnkiWebView):
     script = _script
     scroll_up = False
     scroll_down = False
+    _debug_info_retry_count = 0
 
     def __init__(self, parent):
         super().__init__(parent=parent)
@@ -94,6 +95,7 @@ class Contanki(AnkiWebView):
     def resume(self):
         """Resumes the add-on"""
         self.stdHtml(f"""<script type="text/javascript">\n{self.script}\n</script>""")
+        QTimer.singleShot(250, self.update_debug_info)
 
     @property
     def profile(self) -> Profile | None:
@@ -166,6 +168,16 @@ class Contanki(AnkiWebView):
 
         return if_connected_wrapper
 
+    @staticmethod
+    def _button_pressed(buttons: list[bool], index: int | None) -> bool:
+        """Returns a button state without assuming the controller reported every index."""
+        return index is not None and 0 <= index < len(buttons) and buttons[index]
+
+    @staticmethod
+    def _axis_value(axes: list[float], index: int) -> float:
+        """Returns an axis value without assuming the controller reported every index."""
+        return axes[index] if 0 <= index < len(axes) else 0.0
+
     @if_connected
     def poll(self, input_buttons: str, input_axes: str) -> None:
         """Handles the polling of the controller"""
@@ -213,6 +225,8 @@ class Contanki(AnkiWebView):
         axes = [float(axis) for axis in input_axes.split(",")]
         while len(self.buttons) < len(buttons):
             self.buttons.append(buttons[len(self.buttons)])
+        while len(self.axes) < len(axes):
+            self.axes.append(False)
         self.controller_specific_fixes(buttons, axes)
         return buttons, axes
 
@@ -224,10 +238,12 @@ class Contanki(AnkiWebView):
             and any(axes)
             and not any(buttons[12:16])
         ):
-            buttons[12] = axes[1] < -0.5 or axes[3] < -0.5
-            buttons[13] = axes[1] > 0.5 or axes[3] > 0.5
-            buttons[14] = axes[0] < -0.5 or axes[2] < -0.5
-            buttons[15] = axes[0] > 0.5 or axes[2] > 0.5
+            while len(buttons) < 16:
+                buttons.append(False)
+            buttons[12] = self._axis_value(axes, 1) < -0.5 or self._axis_value(axes, 3) < -0.5
+            buttons[13] = self._axis_value(axes, 1) > 0.5 or self._axis_value(axes, 3) > 0.5
+            buttons[14] = self._axis_value(axes, 0) < -0.5 or self._axis_value(axes, 2) < -0.5
+            buttons[15] = self._axis_value(axes, 0) > 0.5 or self._axis_value(axes, 2) > 0.5
 
         if (
             self.profile.controller.parent == "8BitDo Zero (D Input)"
@@ -243,6 +259,8 @@ class Contanki(AnkiWebView):
         """Handles the polling of the controller when in the config dialog"""
         for i, value in enumerate(axes):
             pressed = abs(value) > 0.5
+            if i >= len(self.axes):
+                self.axes.append(False)
             if pressed != self.axes[i]:
                 changed.append((i + 200, pressed))
                 if pressed:
@@ -268,25 +286,44 @@ class Contanki(AnkiWebView):
         if (
             self.quick_select.settings["Select with D-Pad"]
             and self.profile.controller.dpad_buttons is not None
-            and any(buttons[index] for index in self.profile.controller.dpad_buttons)
+            and any(
+                self._button_pressed(buttons, index)
+                for index in self.profile.controller.dpad_buttons
+            )
         ):
             up, down, left, right = self.profile.controller.dpad_buttons
-            dpad_status = buttons[up], buttons[down], buttons[left], buttons[right]
+            dpad_status = (
+                self._button_pressed(buttons, up),
+                self._button_pressed(buttons, down),
+                self._button_pressed(buttons, left),
+                self._button_pressed(buttons, right),
+            )
             self.quick_select.dpad_select(state, dpad_status)
             for index in self.profile.controller.dpad_buttons:
-                self.buttons[index] = buttons[index]
+                if 0 <= index < len(buttons):
+                    while len(self.buttons) <= index:
+                        self.buttons.append(False)
+                    self.buttons[index] = buttons[index]
         elif self.profile.controller.has_stick:
-            self.quick_select.stick_select(state, axes[0], axes[1])
+            self.quick_select.stick_select(
+                state,
+                self._axis_value(axes, 0),
+                self._axis_value(axes, 1),
+            )
 
         if (
             (stick_button := self.profile.controller.stick_button) is not None
             and self.quick_select.settings["Do Action on Stick Press"]
-            and buttons[stick_button]
+            and self._button_pressed(buttons, stick_button)
         ):
             self.quick_select.disappear(True)
+            while len(self.buttons) <= stick_button:
+                self.buttons.append(False)
             self.buttons[stick_button] = buttons[stick_button]
-        elif buttons[0]:
+        elif self._button_pressed(buttons, 0):
             self.quick_select.disappear(True)
+            while len(self.buttons) <= 0:
+                self.buttons.append(False)
             self.buttons[0] = buttons[0]
 
     @if_connected
@@ -364,6 +401,8 @@ class Contanki(AnkiWebView):
                 continue
             action = self.profile.axes_bindings[axis]
             if action == "Buttons":
+                if axis >= len(self.axes):
+                    self.axes.extend([False] * (axis + 1 - len(self.axes)))
                 if abs(value) > 0.5 and not self.axes[axis]:
                     self.do_action(state, axis * 2 + (value > 0) + 100)
                 self.axes[axis] = abs(value) > 0.5
@@ -479,13 +518,20 @@ class Contanki(AnkiWebView):
 
     def update_debug_info(self):
         """Updates the debug info. View by pressing help in the config dialog."""
-        self._evalWithCallback("get_controller_info()", self._update_debug_info)
+        self._evalWithCallback(
+            "typeof get_controller_info === 'function' ? get_controller_info() : null",
+            self._update_debug_info,
+        )
 
     def _update_debug_info(self, controllers: str) -> None:
         """Callback to receive the controller info from the JavaScript interface"""
         if controllers is None:
             self.debug_info: list[list[str]] = []
+            if self._debug_info_retry_count < 12:
+                self._debug_info_retry_count += 1
+                QTimer.singleShot(250, self.update_debug_info)
         else:
+            self._debug_info_retry_count = 0
             self.debug_info = [
                 con.split("%") for con in controllers.split("%%%") if con
             ]

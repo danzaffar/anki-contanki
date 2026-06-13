@@ -1,6 +1,19 @@
 let polling, connected_index, indices, ready, mock_index;
 initialise();
 
+function send_message(message) {
+   bridgeCommand(`contanki::message::${message}`);
+}
+
+function safe_gamepads() {
+   try {
+      return window.navigator.getGamepads();
+   } catch (err) {
+      send_message(`Controller API error: ${err}`);
+      return [];
+   }
+}
+
 function initialise() {
    if (ready) {
       return;
@@ -18,8 +31,8 @@ function initialise() {
    mock = false;
 }
 
-function on_controller_connect() {
-   let controllers = window.navigator.getGamepads();
+function on_controller_connect(event) {
+   let controllers = safe_gamepads();
    let register = "contanki::register";
    indices = [];
    for (let i = 0; i < controllers.length; i++) {
@@ -36,17 +49,15 @@ function on_controller_connect() {
    } else if (indices.length > 1) {
       bridgeCommand(register);
    } else {
-      connect_controller(indices[0]);
+      connect_controller(indices[0], event && event.gamepad);
    }
 }
 
-function connect_controller(i) {
+function connect_controller(i, event_gamepad) {
    window.clearInterval(polling);
-   let con = window.navigator.getGamepads()[i];
+   let con = event_gamepad || safe_gamepads()[i];
    if (con == null) {
-      bridgeCommand(
-         "contanki::message::Could not find controller. Please reconnect your controller and try again."
-      );
+      send_message("Could not find controller. Please reconnect your controller and try again.");
       return;
    }
    bridgeCommand(`contanki::on_connect::${con.buttons.length}::${con.axes.length}::${con.id}`);
@@ -57,7 +68,7 @@ function connect_controller(i) {
 function on_controller_disconnect(event) {
    window.clearInterval(polling);
    connected_index = null;
-   let controllers = window.navigator.getGamepads();
+   let controllers = safe_gamepads();
    for (let i = 0; i < controllers.length; i++) {
       if (controllers[i] != null) {
          on_controller_connect(event);
@@ -72,7 +83,11 @@ function poll() {
       return;
    }
 
-   let con = window.navigator.getGamepads()[connected_index];
+   let con = safe_gamepads()[connected_index];
+   if (con == null) {
+      on_controller_disconnect("controller missing");
+      return;
+   }
 
    try {
       if (!con.connected) {
@@ -114,7 +129,7 @@ function mock_poll() {
 }
 
 function get_controller_info() {
-   let controllers = window.navigator.getGamepads();
+   let controllers = safe_gamepads();
    let ids = "";
    for (let i = 0; i < controllers.length; i++) {
       let con = controllers[i];
